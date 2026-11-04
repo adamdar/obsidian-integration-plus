@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { expect, test } from "@effect/vitest";
 import { getMermaidFileName, parseMarkdownToADF } from "@markdown-confluence/lib";
+import { wikilinksToPageLinks } from "../wikilinks";
 import { MERGE_FORMAT, adfToMergeMarkdown } from "./adfMarkdown";
 import type { ConfluenceRemote, RemoteChild, RemotePage } from "./confluenceRemote";
 import {
@@ -882,6 +883,7 @@ test.each([
 		expect(files[path]).toBe("# Imported heading\n\nRemote content.\n");
 		expect(frontmatter.get(path)).toEqual({
 			"connie-page-id": "123",
+			"connie-page-url": `${BASE_URL}/wiki/pages/viewpage.action?pageId=123`,
 			"connie-publish": true,
 			"connie-dont-change-parent-page": true,
 			...(renamed ? { "connie-title": title } : {}),
@@ -1103,26 +1105,98 @@ test.each(["edited", "cancelled"])(
 	},
 );
 
-test("overwrite uses shared media conversion without reusing local Mermaid sources", async () => {
-	const text = '---\nconnie-page-id: "1"\n---\n```mermaid\ngraph TD\nA --> B\n```\n';
-	const { vault, files } = fakeVault({ "A.md": text });
-	const { store, bases } = fakeState();
-	let ensured = false;
-	const media = {
-		ensure: async (
-			_adf: unknown,
-			options: { download: boolean; diagrams: Map<string, string> },
-		) => {
-			expect(options.download).toBe(true);
-			expect(options.diagrams.size).toBe(0);
-			ensured = true;
-			return [];
-		},
-		resolver: () => () => "![[remote.png]]",
-	};
-	const remote = fakeRemote([{ ...page("1", "", 2), adf: { ...mediaDoc("image"), version: 1 } }]);
-	await new PullService(remote, vault, store, media).overwritePage({ ...OPTIONS, pageId: "1" });
-	expect(ensured).toBe(true);
-	expect(files["A.md"]).toBe('---\nconnie-page-id: "1"\n---\n![[remote.png]]\n');
-	expect(bases.get("1")?.unresolvedMedia).toEqual([]);
-});
+test.each(["local", "baseline"])(
+	"overwrite recovers matching Mermaid source from the %s",
+	async (source) => {
+		const code = "graph TD\n  A --> B";
+		const block = `\`\`\`mermaid\n${code}\n\`\`\``;
+		const frontmatter = '---\nconnie-page-id: "1"\n---\n';
+		const local = source === "local" ? `${block}\n\nLocal-only text.\n` : "Local-only text.\n";
+		const { vault, files } = fakeVault({ "A.md": frontmatter + local });
+		const { store, bases } = fakeState(source === "baseline" ? [base("1", block, 1)] : []);
+		const downloaded: string[] = [];
+		const media = new MediaSync(
+			{
+				listAttachments: async () => [
+					{ id: "att1", title: getMermaidFileName(code, "png").uploadFilename, fileId: "diagram" },
+				],
+				downloadAttachment: async () => {
+					downloaded.push("diagram");
+					return new Uint8Array([1]);
+				},
+			},
+			{
+				filePaths: () => [],
+				exists: () => false,
+				pathInUse: async () => false,
+				readBinary: async () => new Uint8Array(),
+				writeBinary: async () => {},
+			},
+			store,
+			"images",
+		);
+		const remoteAdf = {
+			type: "doc",
+			version: 1,
+			content: [
+				{
+					type: "mediaSingle",
+					content: [
+						{ type: "media", attrs: { id: "diagram", type: "file", collection: "contentId-1" } },
+					],
+				},
+				{ type: "paragraph", content: [{ type: "text", text: "Remote text." }] },
+			],
+		};
+		const report = await new PullService(
+			fakeRemote([{ ...page("1", "", 2), adf: remoteAdf }]),
+			vault,
+			store,
+			media,
+		).overwritePage({ ...OPTIONS, pageId: "1" });
+		expect(report.updated).toEqual(["A.md"]);
+		expect(files["A.md"]).toBe(`${frontmatter}${block}\n\nRemote text.\n`);
+		expect(downloaded).toEqual([]);
+		expect(bases.get("1")?.markdown).toBe(`${block}\n\nRemote text.\n`);
+		expect(bases.get("1")?.localFingerprint).toBe(fingerprintOf(files["A.md"]!));
+	},
+);
+
+test.each([
+	{ confluenceBaseUrl: BASE_URL, confluenceSiteUrl: BASE_URL },
+	{
+		confluenceBaseUrl: "https://api.atlassian.com/ex/confluence/site-id",
+		confluenceSiteUrl: `${BASE_URL}/wiki/`,
+	},
+])(
+	"import stores a browser URL before fingerprinting and resolves first-publish wikilinks ($confluenceBaseUrl)",
+	async (urls) => {
+		const { vault, frontmatter } = fakeVault({});
+		const { store } = fakeState();
+		// Creating the complete frontmatter must precede the first fingerprint.
+		vault.fingerprint = async (path) => {
+			expect(frontmatter.get(path)?.["connie-page-url"]).toBe(
+				`${BASE_URL}/wiki/pages/viewpage.action?pageId=123`,
+			);
+			return fingerprintOf(path);
+		};
+		const result = await new PullService(
+			fakeRemote([page("123", "Imported body.\n", 1, { title: "Imported" })]),
+			vault,
+			store,
+			NO_MEDIA,
+		).importPage({ ...urls, pageId: "123", folder: "Docs" });
+		expect(result.path).toBe("Docs/Imported.md");
+		const published = wikilinksToPageLinks("See [[Imported|the imported page]].", (link) => {
+			expect(link).toBe("Imported");
+			const url = frontmatter.get(result.path)?.["connie-page-url"];
+			return typeof url === "string" ? url : undefined;
+		});
+		expect(published).toBe(
+			`See [the imported page](${BASE_URL}/wiki/pages/viewpage.action?pageId=123).`,
+		);
+		const publishedAdf = JSON.stringify(parseMarkdownToADF(published, urls.confluenceBaseUrl));
+		expect(publishedAdf).toContain(`${BASE_URL}/wiki/pages/viewpage.action?pageId=123`);
+		expect(publishedAdf).not.toContain("wikilink:");
+	},
+);

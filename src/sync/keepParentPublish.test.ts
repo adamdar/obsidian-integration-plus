@@ -10,6 +10,7 @@ import {
 	type RequiredConfluenceClient,
 } from "@markdown-confluence/lib";
 import { Effect } from "effect";
+import * as EffectPath from "effect/Path";
 import { independentNotes, publishKeepingParents } from "./keepParentPublish";
 import { notesForPartialPublish } from "./partialPublish";
 
@@ -85,6 +86,8 @@ function fixture(files: MarkdownFile[]) {
 		Effect.runPromise(
 			(adapted ? publishKeepingParents(publisher, filter) : publisher.publishEffect(filter)).pipe(
 				Effect.provideService(MarkdownWorkspaceService, workspace),
+				// Vault paths use POSIX semantics on every OS, including Windows.
+				Effect.provide(EffectPath.layer),
 				Effect.provide(MarkdownConfluencePlatformLive),
 			),
 		);

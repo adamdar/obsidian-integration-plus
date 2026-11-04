@@ -1,5 +1,11 @@
 import { errorMessage } from "../errors";
-import { KEEP_PARENT_KEY, PAGE_ID_KEY, PAGE_TITLE_KEY, PUBLISH_KEY } from "../frontmatterKeys";
+import {
+	KEEP_PARENT_KEY,
+	PAGE_ID_KEY,
+	PAGE_TITLE_KEY,
+	PAGE_URL_KEY,
+	PUBLISH_KEY,
+} from "../frontmatterKeys";
 import { joinPath, parentOf } from "../paths";
 import { MERGE_FORMAT, adfToMergeMarkdown, neutralizeLegacyBase } from "./adfMarkdown";
 import type { ConfluenceRemote, RemoteChild, RemotePage } from "./confluenceRemote";
@@ -169,9 +175,17 @@ export class PullService {
 			throw new Error(
 				`A file or folder already exists at ${path}. Choose another destination folder.`,
 			);
+		// The browser URL lets other notes link here before this note's first publish.
+		// Use the site address: OAuth API gateway URLs aren't browser page URLs.
+		const pageUrl = new URL(
+			"/wiki/pages/viewpage.action",
+			options.confluenceSiteUrl || options.confluenceBaseUrl,
+		);
+		pageUrl.searchParams.set("pageId", page.id);
 		// Imported pages can publish from the chosen folder without moving their remote parent.
 		const frontmatter: Record<string, string | boolean> = {
 			[PAGE_ID_KEY]: page.id,
+			[PAGE_URL_KEY]: pageUrl.href,
 			[PUBLISH_KEY]: true,
 			[KEEP_PARENT_KEY]: true,
 		};
@@ -344,7 +358,7 @@ export class PullService {
 			page,
 			options,
 			resolve,
-			options.overwrite ? [] : [local, base?.markdown ?? ""],
+			[local, base?.markdown ?? ""],
 			this.imageSkipped(report, path),
 		);
 		const { frontmatter, body } = splitFrontmatter(local);

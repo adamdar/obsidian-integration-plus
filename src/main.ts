@@ -60,6 +60,7 @@ import {
 } from "./sync/obsidianVault";
 import { notesForPartialPublish, partialWorkspace } from "./sync/partialPublish";
 import { ImportPageModal } from "./sync/ImportPageModal";
+import { OverwritePullModal } from "./sync/OverwritePullModal";
 import { PullService } from "./sync/pull";
 import { PullResultsModal, summarizePull } from "./sync/PullResultsModal";
 import {
@@ -165,7 +166,16 @@ export default class ConfluencePlugin extends Plugin {
 				const file = this.app.workspace.getActiveViewOfType(MarkdownView)?.file;
 				const pageId = file ? linkedPageId(this.app, file) : undefined;
 				if (!pageId) return false;
-				if (!checking) void this.runPull([pageId], true);
+				if (!checking && file) {
+					// Capture the target before opening the modal; switching notes must not change it.
+					new OverwritePullModal(this.app, file.path, async () => {
+						if (linkedPageId(this.app, file) !== pageId) {
+							new Notice("The note's Confluence link changed. Run the overwrite command again.");
+							return;
+						}
+						await this.runPull([pageId], true);
+					}).open();
+				}
 				return true;
 			},
 		});
