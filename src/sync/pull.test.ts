@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { expect, test } from "@effect/vitest";
 import { getMermaidFileName, parseMarkdownToADF } from "@markdown-confluence/lib";
+import { wikilinksToPageLinks } from "../wikilinks";
 import { MERGE_FORMAT, adfToMergeMarkdown } from "./adfMarkdown";
 import type { ConfluenceRemote, RemoteChild, RemotePage } from "./confluenceRemote";
 import {
@@ -75,13 +76,14 @@ function fakeState(initial: SyncBase[] = []) {
 }
 
 function fakeVault(files: Record<string, string>) {
-	const frontmatter = new Map<string, Record<string, string>>();
+	const frontmatter = new Map<string, Record<string, string | boolean>>();
 	const vault: PullVault = {
 		linkedNotes: () =>
 			new Map(
 				Object.entries(files).flatMap(([path, text]) => {
-					const id = /connie-page-id: "?(\d+)/.exec(text)?.[1];
-					return id ? [[id, path] as const] : [];
+					const id =
+						frontmatter.get(path)?.["connie-page-id"] ?? /connie-page-id: "?(\d+)/.exec(text)?.[1];
+					return typeof id === "string" ? [[id, path] as const] : [];
 				}),
 			),
 		read: async (path) => files[path] ?? "",
@@ -415,67 +417,76 @@ test("a note is converted again once a page it links to gets a note", async () =
 	expect(bases.get("1")?.unresolvedLinks).toEqual([]);
 });
 
-test("imports images as embeds of downloaded files in the image folder", async () => {
-	const imageBlock = {
-		type: "mediaSingle",
-		attrs: { widthType: "pixel" },
-		content: [
-			{
-				type: "media",
-				attrs: {
-					alt: "shot.png",
-					collection: "contentId-30",
-					height: 810,
-					id: "file-1",
-					type: "file",
+test.each(["bulk", "single"])(
+	"%s import embeds downloaded images from the image folder",
+	async (mode) => {
+		const imageBlock = {
+			type: "mediaSingle",
+			attrs: { widthType: "pixel" },
+			content: [
+				{
+					type: "media",
+					attrs: {
+						alt: "shot.png",
+						collection: "contentId-30",
+						height: 810,
+						id: "file-1",
+						type: "file",
+					},
 				},
+			],
+		};
+		const pageAdf = {
+			type: "doc",
+			version: 1,
+			content: [
+				{ type: "paragraph", content: [{ type: "text", text: "Images test." }] },
+				imageBlock,
+				{ type: "paragraph" },
+			],
+		};
+		const { vault, files } = fakeVault({});
+		const binaries: Record<string, Uint8Array> = {};
+		const mediaVault = {
+			filePaths: () => [...Object.keys(files), ...Object.keys(binaries)],
+			exists: (path: string) => path in files || path in binaries,
+			pathInUse: async (path: string) => path in files || path in binaries,
+			readBinary: async (path: string) => binaries[path] ?? new Uint8Array(),
+			writeBinary: async (path: string, data: Uint8Array) => void (binaries[path] = data),
+		};
+		const remote = fakeRemote([{ ...page("30", "", 1, { title: "With image" }), adf: pageAdf }], {
+			root: [{ id: "30", title: "With image" }],
+		});
+		const downloads: string[] = [];
+		const mediaRemote = {
+			listAttachments: async () => [
+				{ id: "att1", title: "08-52-33 09-16-2026.png", fileId: "file-1" },
+			],
+			downloadAttachment: async (pageId: string, attachmentId: string) => {
+				downloads.push(`${pageId}/${attachmentId}`);
+				return new Uint8Array([1, 2, 3]);
 			},
-		],
-	};
-	const pageAdf = {
-		type: "doc",
-		version: 1,
-		content: [
-			{ type: "paragraph", content: [{ type: "text", text: "Images test." }] },
-			imageBlock,
-			{ type: "paragraph" },
-		],
-	};
-	const { vault, files } = fakeVault({});
-	const binaries: Record<string, Uint8Array> = {};
-	const mediaVault = {
-		filePaths: () => [...Object.keys(files), ...Object.keys(binaries)],
-		exists: (path: string) => path in files || path in binaries,
-		pathInUse: async (path: string) => path in files || path in binaries,
-		readBinary: async (path: string) => binaries[path] ?? new Uint8Array(),
-		writeBinary: async (path: string, data: Uint8Array) => void (binaries[path] = data),
-	};
-	const remote = fakeRemote([{ ...page("30", "", 1, { title: "With image" }), adf: pageAdf }], {
-		root: [{ id: "30", title: "With image" }],
-	});
-	const downloads: string[] = [];
-	const mediaRemote = {
-		listAttachments: async () => [
-			{ id: "att1", title: "08-52-33 09-16-2026.png", fileId: "file-1" },
-		],
-		downloadAttachment: async (pageId: string, attachmentId: string) => {
-			downloads.push(`${pageId}/${attachmentId}`);
-			return new Uint8Array([1, 2, 3]);
-		},
-	};
-	const { store, media } = fakeState();
-	const sync = new MediaSync(mediaRemote, mediaVault, store, "images");
-	const report = await new PullService(remote, vault, store, sync).pull({
-		...OPTIONS,
-		importUnder: { rootPageId: "root", rootFolder: "Docs" },
-	});
-
-	expect(report.imported).toEqual(["Docs/With image.md"]);
-	expect(files["Docs/With image.md"]).toBe("Images test.\n\n![[08-52-33 09-16-2026.png]]\n");
-	expect(binaries["images/08-52-33 09-16-2026.png"]).toEqual(new Uint8Array([1, 2, 3]));
-	expect(media).toEqual({ "file-1": "images/08-52-33 09-16-2026.png" });
-	expect(downloads).toEqual(["30/att1"]);
-});
+		};
+		const { store, media } = fakeState();
+		const sync = new MediaSync(mediaRemote, mediaVault, store, "images");
+		const service = new PullService(remote, vault, store, sync);
+		if (mode === "single") {
+			const result = await service.importPage({ ...OPTIONS, pageId: "30", folder: "Docs" });
+			expect(result.path).toBe("Docs/With image.md");
+			expect(result.warnings).toEqual([]);
+		} else {
+			const report = await service.pull({
+				...OPTIONS,
+				importUnder: { rootPageId: "root", rootFolder: "Docs" },
+			});
+			expect(report.imported).toEqual(["Docs/With image.md"]);
+		}
+		expect(files["Docs/With image.md"]).toBe("Images test.\n\n![[08-52-33 09-16-2026.png]]\n");
+		expect(binaries["images/08-52-33 09-16-2026.png"]).toEqual(new Uint8Array([1, 2, 3]));
+		expect(media).toEqual({ "file-1": "images/08-52-33 09-16-2026.png" });
+		expect(downloads).toEqual(["30/att1"]);
+	},
+);
 
 test("reuses downloaded and published images instead of downloading again", async () => {
 	const files: Record<string, string> = {
@@ -867,3 +878,365 @@ test("note names stay valid file names on Windows after shortening", () => {
 	expect(toNoteName("con.txt", "1")).toBe("con page.txt");
 	expect(toNoteName("Console", "1")).toBe("Console");
 });
+
+test.each([
+	{ title: "Normal title", folder: "Docs", path: "Docs/Normal title.md", renamed: false },
+	{ title: "Title: with slash/", folder: "", path: "Title- with slash-.md", renamed: true },
+])(
+	"single import creates $path with content, frontmatter and a sync base",
+	async ({ title, folder, path, renamed }) => {
+		const { vault, files, frontmatter } = fakeVault({});
+		const { store, bases } = fakeState();
+		const remote = fakeRemote([
+			page("123", "# Imported heading\n\nRemote content.\n", 7, { title, authorId: ME }),
+		]);
+		const service = new PullService(remote, vault, store, NO_MEDIA);
+		const result = await service.importPage({ ...OPTIONS, pageId: "123", folder });
+
+		expect(result).toEqual({ path, title, warnings: [] });
+		expect(files[path]).toBe("# Imported heading\n\nRemote content.\n");
+		expect(frontmatter.get(path)).toEqual({
+			"connie-page-id": "123",
+			"connie-page-url": `${BASE_URL}/wiki/pages/viewpage.action?pageId=123`,
+			"connie-publish": true,
+			"connie-dont-change-parent-page": true,
+			...(renamed ? { "connie-title": title } : {}),
+		});
+		expect(bases.get("123")).toEqual({
+			pageId: "123",
+			version: 7,
+			title,
+			markdown: files[path],
+			format: MERGE_FORMAT,
+			unresolvedLinks: [],
+			unresolvedMedia: [],
+			localFingerprint: fingerprintOf(files[path]!),
+		});
+		const report = await service.pull({ ...OPTIONS, pageIds: ["123"] });
+		expect(report.noHistory).toEqual([]);
+		expect(report.unchanged).toBe(1);
+		const notes = [{ path, pageId: "123", text: files[path]! }];
+		expect((await checkBeforePublish(notes, remote, store)).blocked).toEqual([]);
+		expect(await findChangedNotes(notes, store, (path) => vault.fingerprint(path))).toEqual([]);
+	},
+);
+
+test("single import rejects a duplicate link and identifies its note", async () => {
+	const { vault, files } = fakeVault({
+		"Existing.md": '---\nconnie-page-id: "123"\n---\nExisting.\n',
+	});
+	const { store, bases } = fakeState();
+	const service = new PullService(
+		fakeRemote([page("123", "Remote.\n", 1)]),
+		vault,
+		store,
+		NO_MEDIA,
+	);
+	await expect(service.importPage({ ...OPTIONS, pageId: "123", folder: "Docs" })).rejects.toThrow(
+		"already linked to Existing.md",
+	);
+	expect(Object.keys(files)).toEqual(["Existing.md"]);
+	expect(bases.size).toBe(0);
+});
+
+test("single import refuses an occupied destination before downloading media", async () => {
+	const { vault, files } = fakeVault({ "Docs/page 123.md": "Keep me.\n" });
+	const { store, bases } = fakeState();
+	const media = {
+		...NO_MEDIA,
+		ensure: async () => {
+			throw new Error("Should not download");
+		},
+	};
+	const service = new PullService(fakeRemote([page("123", "Remote.\n", 1)]), vault, store, media);
+	await expect(service.importPage({ ...OPTIONS, pageId: "123", folder: "Docs" })).rejects.toThrow(
+		"already exists at Docs/Page 123.md",
+	);
+	expect(files).toEqual({ "Docs/page 123.md": "Keep me.\n" });
+	expect(bases.size).toBe(0);
+});
+
+test("single import reports missing pages without creating a note or base", async () => {
+	const { vault, files } = fakeVault({});
+	const { store, bases } = fakeState();
+	await expect(
+		new PullService(fakeRemote([]), vault, store, NO_MEDIA).importPage({
+			...OPTIONS,
+			pageId: "123",
+			folder: "",
+		}),
+	).rejects.toThrow("not found or is inaccessible");
+	expect(files).toEqual({});
+	expect(bases.size).toBe(0);
+});
+
+test("single import resolves links to existing notes and itself", async () => {
+	const { vault, files } = fakeVault({ "Existing.md": '---\nconnie-page-id: "1"\n---\nText.\n' });
+	const remote = fakeRemote([
+		page(
+			"123",
+			`See [Existing](${BASE_URL}/wiki/spaces/ABC/pages/1/Title) and [Self](${BASE_URL}/wiki/spaces/ABC/pages/123/Title).\n`,
+			1,
+		),
+	]);
+	await new PullService(remote, vault, fakeState().store, NO_MEDIA).importPage({
+		...OPTIONS,
+		pageId: "123",
+		folder: "Docs",
+	});
+	expect(files["Docs/Page 123.md"]).toBe("See [[Existing]] and [[Page 123|Self]].\n");
+});
+
+test("single import preserves unresolved media and reports download failures", async () => {
+	const { vault, files } = fakeVault({});
+	const { store, bases } = fakeState();
+	const media = { ...NO_MEDIA, ensure: async () => ["Attachment unavailable"] };
+	const remote = fakeRemote([
+		{ ...page("123", "", 1), adf: { ...mediaDoc("missing"), version: 1 } },
+	]);
+	const result = await new PullService(remote, vault, store, media).importPage({
+		...OPTIONS,
+		pageId: "123",
+		folder: "",
+	});
+	expect(result.warnings).toEqual(["An image wasn't downloaded: Attachment unavailable"]);
+	expect(files[result.path]).toContain("```adf");
+	expect(bases.get("123")?.unresolvedMedia).toEqual(["missing"]);
+});
+
+test("single import cancelled during conversion creates no note or base", async () => {
+	const { vault, files } = fakeVault({});
+	const { store, bases } = fakeState();
+	const controller = new AbortController();
+	const media = {
+		...NO_MEDIA,
+		ensure: async () => {
+			controller.abort();
+			return [];
+		},
+	};
+	await expect(
+		new PullService(fakeRemote([page("123", "Remote.\n", 1)]), vault, store, media).importPage({
+			...OPTIONS,
+			pageId: "123",
+			folder: "",
+			signal: controller.signal,
+		}),
+	).rejects.toThrow();
+	expect(files).toEqual({});
+	expect(bases.size).toBe(0);
+});
+
+// Overwrite deliberately bypasses the merge gates, including unchanged remote versions.
+test.each(["same version", "no history", "conflict markers"])(
+	"overwrite replaces local edits with %s and starts the note in sync",
+	async (scenario) => {
+		const frontmatterText = '---\nconnie-page-id: "1"\ntags: [keep]\n---\n';
+		const local =
+			scenario === "conflict markers"
+				? "<<<<<<< Obsidian\nMine.\n=======\nTheirs.\n>>>>>>> Confluence\n"
+				: "Local edits that will be discarded.\n";
+		const { vault, files, frontmatter } = fakeVault({ "A.md": frontmatterText + local });
+		const { store, bases } = fakeState(scenario === "no history" ? [] : [base("1", "Old.\n", 2)]);
+		const remote = fakeRemote([
+			page("1", "Remote body.\n", 2, { authorId: ME, title: "Remote title" }),
+		]);
+		const report = await new PullService(remote, vault, store, NO_MEDIA).overwritePage({
+			...OPTIONS,
+			pageId: "1",
+		});
+
+		expect(files["A.md"]).toBe(frontmatterText + "Remote body.\n");
+		expect(frontmatter.get("A.md")).toEqual({ "connie-title": "Remote title" });
+		expect(report.updated).toEqual(["A.md"]);
+		expect(report.conflicted).toEqual([]);
+		expect(report.noHistory).toEqual([]);
+		expect(bases.get("1")).toMatchObject({
+			version: 2,
+			title: "Remote title",
+			markdown: "Remote body.\n",
+			localFingerprint: fingerprintOf(files["A.md"]!),
+		});
+	},
+);
+
+test("overwrite refuses a page linked to multiple notes", async () => {
+	const text = '---\nconnie-page-id: "1"\n---\nLocal.\n';
+	const { vault, files } = fakeVault({ "A.md": text, "Copy.md": text });
+	vault.duplicateLinks = () => [{ pageId: "1", paths: ["A.md", "Copy.md"] }];
+	const { store, bases } = fakeState();
+	const report = await new PullService(
+		fakeRemote([page("1", "Remote.\n", 2)]),
+		vault,
+		store,
+		NO_MEDIA,
+	).overwritePage({ ...OPTIONS, pageId: "1" });
+	expect(report.updated).toEqual([]);
+	expect(report.skipped).toHaveLength(2);
+	expect(files).toEqual({ "A.md": text, "Copy.md": text });
+	expect(bases.size).toBe(0);
+});
+
+test("overwrite leaves the note and base intact when its page is missing", async () => {
+	const text = '---\nconnie-page-id: "1"\n---\nLocal.\n';
+	const { vault, files } = fakeVault({ "A.md": text });
+	const original = base("1", "Old.\n", 1);
+	const { store, bases } = fakeState([original]);
+	const report = await new PullService(fakeRemote([]), vault, store, NO_MEDIA).overwritePage({
+		...OPTIONS,
+		pageId: "1",
+	});
+	expect(report.deleted).toEqual(["A.md"]);
+	expect(files["A.md"]).toBe(text);
+	expect(bases.get("1")).toEqual(original);
+});
+
+test.each(["edited", "cancelled"])(
+	"overwrite stops if %s during media conversion",
+	async (scenario) => {
+		const text = '---\nconnie-page-id: "1"\n---\nLocal.\n';
+		const { vault, files } = fakeVault({ "A.md": text });
+		const { store, bases } = fakeState();
+		const controller = new AbortController();
+		const media = {
+			...NO_MEDIA,
+			ensure: async () => {
+				if (scenario === "edited") files["A.md"] = text + "New edit.\n";
+				else controller.abort();
+				return [];
+			},
+		};
+		const report = await new PullService(
+			fakeRemote([page("1", "Remote.\n", 2)]),
+			vault,
+			store,
+			media,
+		).overwritePage({ ...OPTIONS, pageId: "1", signal: controller.signal });
+		expect(report.updated).toEqual([]);
+		expect(report.skipped).toHaveLength(1);
+		expect(files["A.md"]).toBe(scenario === "edited" ? text + "New edit.\n" : text);
+		expect(bases.size).toBe(0);
+	},
+);
+
+test.each(["local", "baseline"])(
+	"overwrite recovers matching Mermaid source from the %s",
+	async (source) => {
+		const code = "graph TD\n  A --> B";
+		const block = `\`\`\`mermaid\n${code}\n\`\`\``;
+		const frontmatter = '---\nconnie-page-id: "1"\n---\n';
+		const local = source === "local" ? `${block}\n\nLocal-only text.\n` : "Local-only text.\n";
+		const { vault, files } = fakeVault({ "A.md": frontmatter + local });
+		const { store, bases } = fakeState(source === "baseline" ? [base("1", block, 1)] : []);
+		const downloaded: string[] = [];
+		const media = new MediaSync(
+			{
+				listAttachments: async () => [
+					{ id: "att1", title: getMermaidFileName(code, "png").uploadFilename, fileId: "diagram" },
+				],
+				downloadAttachment: async () => {
+					downloaded.push("diagram");
+					return new Uint8Array([1]);
+				},
+			},
+			{
+				filePaths: () => [],
+				exists: () => false,
+				pathInUse: async () => false,
+				readBinary: async () => new Uint8Array(),
+				writeBinary: async () => {},
+			},
+			store,
+			"images",
+		);
+		const remoteAdf = {
+			type: "doc",
+			version: 1,
+			content: [
+				{
+					type: "mediaSingle",
+					content: [
+						{ type: "media", attrs: { id: "diagram", type: "file", collection: "contentId-1" } },
+					],
+				},
+				{ type: "paragraph", content: [{ type: "text", text: "Remote text." }] },
+			],
+		};
+		const report = await new PullService(
+			fakeRemote([{ ...page("1", "", 2), adf: remoteAdf }]),
+			vault,
+			store,
+			media,
+		).overwritePage({ ...OPTIONS, pageId: "1" });
+		expect(report.updated).toEqual(["A.md"]);
+		expect(files["A.md"]).toBe(`${frontmatter}${block}\n\nRemote text.\n`);
+		expect(downloaded).toEqual([]);
+		expect(bases.get("1")?.markdown).toBe(`${block}\n\nRemote text.\n`);
+		expect(bases.get("1")?.localFingerprint).toBe(fingerprintOf(files["A.md"]!));
+	},
+);
+
+test.each([
+	{ confluenceBaseUrl: BASE_URL, confluenceSiteUrl: BASE_URL },
+	{
+		confluenceBaseUrl: "https://api.atlassian.com/ex/confluence/site-id",
+		confluenceSiteUrl: `${BASE_URL}/wiki/`,
+	},
+])(
+	"import stores a browser URL before fingerprinting and resolves first-publish wikilinks ($confluenceBaseUrl)",
+	async (urls) => {
+		const { vault, frontmatter } = fakeVault({});
+		const { store } = fakeState();
+		// Creating the complete frontmatter must precede the first fingerprint.
+		vault.fingerprint = async (path) => {
+			expect(frontmatter.get(path)?.["connie-page-url"]).toBe(
+				`${BASE_URL}/wiki/pages/viewpage.action?pageId=123`,
+			);
+			return fingerprintOf(path);
+		};
+		const result = await new PullService(
+			fakeRemote([page("123", "Imported body.\n", 1, { title: "Imported" })]),
+			vault,
+			store,
+			NO_MEDIA,
+		).importPage({ ...urls, pageId: "123", folder: "Docs" });
+		expect(result.path).toBe("Docs/Imported.md");
+		const published = wikilinksToPageLinks("See [[Imported|the imported page]].", (link) => {
+			expect(link).toBe("Imported");
+			const url = frontmatter.get(result.path)?.["connie-page-url"];
+			return typeof url === "string" ? url : undefined;
+		});
+		expect(published).toBe(
+			`See [the imported page](${BASE_URL}/wiki/pages/viewpage.action?pageId=123).`,
+		);
+		const publishedAdf = JSON.stringify(parseMarkdownToADF(published, urls.confluenceBaseUrl));
+		expect(publishedAdf).toContain(`${BASE_URL}/wiki/pages/viewpage.action?pageId=123`);
+		expect(publishedAdf).not.toContain("wikilink:");
+	},
+);
+
+// Prefer-Confluence only resolves overlapping edits; explicit overwrite discards the whole body.
+test.each([false, true])(
+	"prefer-Confluence remains separate from explicit overwrite (%s)",
+	async (overwrite) => {
+		const frontmatterText = '---\nconnie-page-id: "1"\n---\n';
+		const original = "Intro.\n\nShared.\n\nEnd.\n";
+		const local = "Local-only intro.\n\nLocal shared.\n\nEnd.\n";
+		const remoteBody = "Intro.\n\nRemote shared.\n\nRemote end.\n";
+		const { vault, files } = fakeVault({ "A.md": frontmatterText + local });
+		const { store } = fakeState([base("1", original, 1)]);
+		const report = await new PullService(
+			fakeRemote([page("1", remoteBody, 2)]),
+			vault,
+			store,
+			NO_MEDIA,
+		).pull({ ...OPTIONS, pageIds: ["1"], preferConfluence: true, overwrite });
+		expect(report.conflicted).toEqual([]);
+		expect(files["A.md"]).toBe(
+			frontmatterText +
+				(overwrite ? remoteBody : "Local-only intro.\n\nRemote shared.\n\nRemote end.\n"),
+		);
+		expect(report.overwritten).toEqual(overwrite ? [] : ["A.md"]);
+		expect(report.updated).toEqual(overwrite ? ["A.md"] : []);
+	},
+);

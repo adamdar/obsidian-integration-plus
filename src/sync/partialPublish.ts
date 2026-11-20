@@ -15,7 +15,7 @@ import { baseName, joinPath, parentOf, toVaultPath } from "../paths";
  *
  * So the subset also includes the folder note of every folder on the way to a changed note,
  * and, when needed, another note that keeps the root folder the same. These rules copy
- * `TreeLocal.ts` in `@markdown-confluence/lib` 7.0.0; check them when upgrading the lib.
+ * `TreeLocal.ts` in `@markdown-confluence/lib` 7.0.1; check them when upgrading the lib.
  */
 
 const FOLDER_NOTE_NAMES = ["index", "README", "readme"];
@@ -27,6 +27,7 @@ const FOLDER_NOTE_NAMES = ["index", "README", "readme"];
 export function notesForPartialPublish(
 	allPaths: readonly string[],
 	changed: readonly string[],
+	independent: ReadonlySet<string> = new Set(),
 ): string[] | undefined {
 	const all = new Set(allPaths);
 	const selected = new Set(changed.filter((path) => all.has(path)));
@@ -41,7 +42,9 @@ export function notesForPartialPublish(
 			if (folder === root) break;
 		}
 	};
-	for (const path of [...selected]) addFolderNotes(path);
+	// Linked keep-parent notes do not need their local folder notes published.
+	for (const path of [...selected]) if (!independent.has(path)) addFolderNotes(path);
+	if ([...selected].every((path) => independent.has(path))) return [...selected];
 
 	if (treeRoot([...selected]) !== root) {
 		// Add a note from another branch under the root, so the shared folder is the root again.
@@ -51,7 +54,7 @@ export function notesForPartialPublish(
 			[...all].find((path) => firstSegmentUnder(root, path) !== branch);
 		if (other) {
 			selected.add(other);
-			addFolderNotes(other);
+			if (!independent.has(other)) addFolderNotes(other);
 		}
 	}
 	return treeRoot([...selected]) === root ? [...selected] : undefined;
